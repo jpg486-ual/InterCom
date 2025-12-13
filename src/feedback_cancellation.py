@@ -97,8 +97,6 @@ class Feedback_Cancellation(buffer.Buffering):
         self._delay_step_samples = (
             self._delay_step_ms * minimal.args.frames_per_second / 1000.0
         )
-        self._delay_phase = None
-        self._delay_fraction_samples = 0.0
         if minimal.args.frames_per_chunk > 0:
             estimated_history = int(
                 math.ceil(
@@ -110,7 +108,6 @@ class Feedback_Cancellation(buffer.Buffering):
             estimated_history = 8
         history_length = max(8, estimated_history)
         self._play_history = deque(maxlen=history_length)
-        self._update_delay_phase()
         self._last_sent_chunk = self.generate_zero_chunk()
         self._reference_chunk = self.generate_zero_chunk()
         self._calibrating = minimal.args.feedback_auto_calibrate
@@ -168,24 +165,6 @@ class Feedback_Cancellation(buffer.Buffering):
         )
         self._control_thread.start()
 
-    def _update_delay_phase(self):
-        chunk_size = minimal.args.frames_per_chunk
-        if chunk_size <= 0:
-            self._delay_phase = None
-            self._delay_fraction_samples = 0.0
-            return
-        fractional = math.fmod(self.delay_samples, chunk_size)
-        # Ensure fractional is positive in [0, chunk_size)
-        if fractional < 0:
-            fractional += chunk_size
-        self._delay_fraction_samples = fractional
-        if fractional == 0.0:
-            self._delay_phase = None
-            return
-        freq_indices = np.arange(chunk_size // 2 + 1, dtype=np.float64)
-        phase = -2j * np.pi * freq_indices * (fractional / chunk_size)
-        self._delay_phase = np.exp(phase)[:, np.newaxis].astype(np.complex64)
-
     @property
     def delay_ms(self):
         if minimal.args.frames_per_second <= 0:
@@ -195,7 +174,6 @@ class Feedback_Cancellation(buffer.Buffering):
     def set_delay_samples(self, samples):
         samples = max(0.0, float(samples))
         self.delay_samples = samples
-        self._update_delay_phase()
         logging.info(
             "feedback delay set to %.2f ms (%.1f samples)",
             self.delay_ms,
@@ -279,14 +257,43 @@ class Feedback_Cancellation(buffer.Buffering):
     def _get_reference_playback(self):
         if not self._play_history:
             return self.zero_chunk
+
         chunk_size = minimal.args.frames_per_chunk
-        if chunk_size <= 0:
+        channels = minimal.args.number_of_channels
+        if chunk_size <= 0 or channels <= 0:
             return self.zero_chunk
-        delay_chunks = int(self.delay_samples // chunk_size)
-        index = len(self._play_history) - 1 - delay_chunks
-        if index < 0:
-            index = 0
-        return self._play_history[index]
+
+        delay = float(self.delay_samples)
+        if delay <= 0.0:
+            return self._play_history[-1]
+
+        history_matrix = np.concatenate(self._play_history, axis=0).astype(
+            np.float32,
+            copy=False,
+        )
+        total_samples = history_matrix.shape[0]
+
+        if total_samples < 2:
+            return self.zero_chunk
+
+        if delay >= total_samples - 1:
+            return self.zero_chunk
+
+        start = total_samples - delay - chunk_size
+        if start < 0:
+            return self.zero_chunk
+
+        sample_positions = start + np.arange(chunk_size, dtype=np.float64)
+        lower_indexes = np.floor(sample_positions).astype(np.int64)
+        upper_indexes = np.clip(lower_indexes + 1, 0, total_samples - 1)
+        alphas = (sample_positions - lower_indexes)[:, np.newaxis]
+
+        reference = (
+            (1.0 - alphas) * history_matrix[lower_indexes]
+            + alphas * history_matrix[upper_indexes]
+        )
+
+        return np.clip(np.round(reference), -32768, 32767).astype(np.int16)
 
     def _maybe_override_playback(self, playback_matrix):
         if not self._calibrating or self._calibration_chunks_left <= 0:
@@ -375,8 +382,6 @@ class Feedback_Cancellation(buffer.Buffering):
 
         recorded_fft = np.fft.rfft(recorded, axis=0)
         played_fft = np.fft.rfft(played, axis=0)
-        if self._delay_phase is not None:
-            played_fft = played_fft * self._delay_phase
 
         cancelled_fft = recorded_fft - self.attenuation * played_fft
         cancelled = np.fft.irfft(
