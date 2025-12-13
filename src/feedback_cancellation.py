@@ -401,7 +401,6 @@ class Feedback_Cancellation(buffer.Buffering):
             minimal.args.frames_per_chunk, minimal.args.number_of_channels
         )
         playback_matrix, playback_chunk = self._maybe_override_playback(playback_matrix)
-        self._store_playback(playback_matrix)
         reference_matrix = self._get_reference_playback()
         self._reference_chunk = reference_matrix
 
@@ -410,6 +409,7 @@ class Feedback_Cancellation(buffer.Buffering):
         self.send(packed_chunk)
 
         self.play_chunk(DAC, playback_chunk)
+        self._store_playback(playback_matrix)
         self._last_sent_chunk = processed_chunk
         self._maybe_store_calibration_recording(ADC)
 
