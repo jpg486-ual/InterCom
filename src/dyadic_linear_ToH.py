@@ -7,7 +7,7 @@ import math
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import pywt
@@ -18,6 +18,7 @@ from temporal_overlapped_DWT_coding import (
     Temporal_Overlapped_DWT__verbose,
 )
 from DEFLATE_byteplanes3 import DEFLATE_BytePlanes3 as EC
+from simultaneous_masking import MaskingConfig, SimultaneousMasking
 
 
 minimal.parser.add_argument(
@@ -43,6 +44,33 @@ minimal.parser.add_argument(
     action="store_true",
     help="Load custom ToH thresholds from ./custom_ToH.txt for dyadic bands.",
 )
+minimal.parser.add_argument(
+    "--enable_masking",
+    action="store_true",
+    help="Enable simultaneous masking controller for dynamic quantization steps.",
+)
+minimal.parser.add_argument(
+    "--masking_smoothing",
+    type=float,
+    default=0.6,
+    help="Exponential smoothing factor for masking updates (0 disables smoothing).",
+)
+minimal.parser.add_argument(
+    "--masking_factors",
+    type=str,
+    default="1.0,2.0,3.0",
+    help="Comma-separated neighbour factors applied around the masker band.",
+)
+
+
+def _parse_masking_factors(raw: str) -> Tuple[float, ...]:
+    try:
+        parts = [float(item) for item in raw.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError("--masking_factors must be a comma-separated list of floats") from exc
+    if not parts:
+        raise ValueError("--masking_factors must provide at least one value")
+    return tuple(parts)
 
 
 @dataclass
@@ -76,6 +104,26 @@ class Dyadic_Linear_ToH(Temporal_Overlapped_DWT):
         self._packet_slices = self._build_packet_slices()
         self._custom_toh = self._load_custom_toh() if minimal.args.custom_ToH else None
         self.quantization_steps = self._compute_quantization_steps(max_q=max(1, minimal.args.linear_max_q))
+        self._active_steps = self.quantization_steps.astype(np.int32, copy=True)
+        self._masking: SimultaneousMasking | None = None
+        if minimal.args.enable_masking:
+            max_step = minimal.args.linear_max_q * minimal.args.minimal_quantization_step_size
+            factors = _parse_masking_factors(minimal.args.masking_factors)
+            config = MaskingConfig(
+                minimal_step=minimal.args.minimal_quantization_step_size,
+                maximal_step=max_step,
+                smoothing_factor=minimal.args.masking_smoothing,
+                neighbour_factors=factors,
+            )
+            self._masking = SimultaneousMasking(config)
+            logging.info(
+                "simultaneous masking enabled (smoothing=%s, factors=%s, max_step=%s)",
+                config.smoothing_factor,
+                list(config.neighbour_factors),
+                config.maximal_step,
+            )
+        else:
+            logging.info("simultaneous masking disabled")
         logging.info(
             "linear subbands per band = %d, wpt levels = %d",
             self.linear_subbands,
@@ -246,6 +294,14 @@ class Dyadic_Linear_ToH(Temporal_Overlapped_DWT):
         logging.info("Quantization step sizes: %s", result.tolist())
         return result
 
+    def _update_masking_steps(self, energies: np.ndarray) -> None:
+        if self._masking is None:
+            return
+        try:
+            self._active_steps = self._masking.adjust_steps(energies, self.quantization_steps)
+        except ValueError as exc:
+            logging.warning("Masking adjustment skipped (%s)", exc)
+
     def _average_spl(self, start: float, end: float) -> float:
         # Use logarithmic weighting to emphasize lower frequencies
         start = max(start, 1.0)
@@ -281,38 +337,54 @@ class Dyadic_Linear_ToH(Temporal_Overlapped_DWT):
     def pack(self, chunk_number: int, chunk: np.ndarray) -> bytes:
         dwt_chunk = super().analyze(chunk)
         packets = np.empty_like(dwt_chunk)
+        steps = self._active_steps
+        energy_accumulator = np.zeros_like(steps, dtype=np.float64) if self._masking is not None else None
         for channel in range(minimal.args.number_of_channels):
             packet_idx = 0
             for info, slices in zip(self._subbands, self._packet_slices):
                 subband_data = dwt_chunk[info.idx_slice, channel].astype(np.float64, copy=False)
                 wpt_packets = self._apply_wpt(subband_data)
                 for node_data, target_slice in zip(wpt_packets, slices):
-                    step = self.quantization_steps[packet_idx]
-                    packets[target_slice, channel] = np.rint(node_data / step)
+                    current_idx = packet_idx
+                    step = steps[current_idx]
+                    quantized = np.rint(node_data / step).astype(np.int32)
+                    packets[target_slice, channel] = quantized
+                    if energy_accumulator is not None:
+                        reconstructed = quantized.astype(np.float64, copy=False) * step
+                        energy_accumulator[current_idx] += float(np.sum(reconstructed * reconstructed))
                     packet_idx += 1
-            if packet_idx != len(self.quantization_steps):
+            if packet_idx != len(steps):
                 raise RuntimeError("Unexpected packet count during packing")
+        if energy_accumulator is not None:
+            self._update_masking_steps(energy_accumulator)
         packets = packets.astype(np.int32, copy=False)
         return EC.pack(self, chunk_number, packets)
 
     def unpack(self, packed_chunk: bytes):
         chunk_number, packets = EC.unpack(self, packed_chunk)
         dwt_chunk = np.empty_like(packets, dtype=np.float64)
+        steps = self._active_steps
+        energy_accumulator = np.zeros_like(steps, dtype=np.float64) if self._masking is not None else None
         for channel in range(minimal.args.number_of_channels):
             packet_idx = 0
             for info, slices in zip(self._subbands, self._packet_slices):
                 packet_list = []
                 for target_slice in slices:
-                    step = self.quantization_steps[packet_idx]
+                    current_idx = packet_idx
+                    step = steps[current_idx]
                     data = packets[target_slice, channel].astype(np.float64, copy=False) * step
+                    if energy_accumulator is not None:
+                        energy_accumulator[current_idx] += float(np.sum(data * data))
                     packet_list.append(data)
                     packet_idx += 1
                 reconstructed = self._reconstruct_from_packets(packet_list, info.length)
                 dwt_chunk[info.idx_slice, channel] = reconstructed
-            if packet_idx != len(self.quantization_steps):
+            if packet_idx != len(steps):
                 raise RuntimeError("Unexpected packet count during unpacking")
         dwt_chunk = dwt_chunk.astype(np.int32, copy=False)
         chunk = super().synthesize(dwt_chunk)
+        if energy_accumulator is not None:
+            self._update_masking_steps(energy_accumulator)
         return chunk_number, chunk
 
 
