@@ -151,14 +151,14 @@ class Dyadic_Linear_ToH(Temporal_Overlapped_DWT):
         try:
             with table_path.open("r", encoding="utf-8", errors="ignore") as handle:
                 for line in handle:
-                    line = line.split('#')[0].strip() # Eliminar comentarios
-                    if not line or line.startswith("["): continue # Saltar cabeceras
+                    line = line.split('#')[0].strip()
+                    if not line or line.startswith("["): continue
                     parts = line.split()
                     if len(parts) >= 3:
                         try:
                             values.append(float(parts[2]))
                         except ValueError:
-                            logging.warning("Invalid ToH value '%s' in %s. Ignoring table.", parts[2], table_path)
+                            logging.warning("Invalid ToH value '%s' in %s.", parts[2], table_path)
                             continue
         except OSError as exc:
             logging.warning("Unable to read %s (%s). Using fallback thresholds.", table_path, exc)
