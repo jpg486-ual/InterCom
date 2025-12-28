@@ -64,7 +64,7 @@ minimal.parser.add_argument(
 minimal.parser.add_argument(
     "--feedback_calibration_duration",
     type=float,
-    default=0.5,
+    default=2.0,
     help="Duration of the calibration tone in seconds",
 )
 minimal.parser.add_argument(
@@ -86,7 +86,7 @@ class Feedback_Cancellation(buffer.Buffering):
         )
         self._attenuation_step = max(minimal.args.feedback_step, 0.0)
         self._control_help_text = (
-            "Controls: '+', '=', or ']' increase attenuation; '-', '_' or '[' decrease attenuation; 'a <value>' sets attenuation; '>' increases delay; '<' decreases delay; 'd <ms>' sets delay milliseconds; 'h' prints help."
+            "Controls: '+', '=', or ']' increase attenuation; '-', '_' or '[' decrease attenuation; 'a <value>' sets attenuation; '>' increases delay; '<' decreases delay; 'd <ms>' sets delay milliseconds; '0' resets delay to 0; 'h' prints help."
         )
         self.attenuation = self._clamp_attenuation(minimal.args.feedback_attenuation)
         self.delay_samples = max(
@@ -94,9 +94,6 @@ class Feedback_Cancellation(buffer.Buffering):
             minimal.args.feedback_delay_ms * minimal.args.frames_per_second / 1000.0,
         )
         self._delay_step_ms = max(minimal.args.feedback_delay_step_ms, 0.0)
-        self._delay_step_samples = (
-            self._delay_step_ms * minimal.args.frames_per_second / 1000.0
-        )
         if minimal.args.frames_per_chunk > 0:
             estimated_history = int(
                 math.ceil(
@@ -239,6 +236,8 @@ class Feedback_Cancellation(buffer.Buffering):
                     self.set_delay_ms(value_ms)
                 else:
                     logging.info("Usage: d <milliseconds>")
+            elif command == "0":
+                self.set_delay_ms(0.0)
             elif command in {"h", "help"}:
                 logging.info(self._control_help_text)
             else:
@@ -401,6 +400,7 @@ class Feedback_Cancellation(buffer.Buffering):
             minimal.args.frames_per_chunk, minimal.args.number_of_channels
         )
         playback_matrix, playback_chunk = self._maybe_override_playback(playback_matrix)
+        self._store_playback(playback_matrix)
         reference_matrix = self._get_reference_playback()
         self._reference_chunk = reference_matrix
 
@@ -409,7 +409,6 @@ class Feedback_Cancellation(buffer.Buffering):
         self.send(packed_chunk)
 
         self.play_chunk(DAC, playback_chunk)
-        self._store_playback(playback_matrix)
         self._last_sent_chunk = processed_chunk
         self._maybe_store_calibration_recording(ADC)
 
