@@ -148,7 +148,7 @@ minimal.parser.add_argument(
     "--toh-tolerance",
     type=float,
     default=0.0,
-    help="Stop when upper-lower <= tolerance (0 -> 5% of the minimal step).",
+    help="Stop when upper-lower <= tolerance (0 -> 5%% of the minimal step).",
 )
 minimal.parser.add_argument(
     "--toh-reversals",
