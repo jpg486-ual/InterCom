@@ -51,6 +51,12 @@ minimal.parser.add_argument(
     help="Step used to modify the delay with the keyboard controls (milliseconds)",
 )
 minimal.parser.add_argument(
+    "--feedback_max_delay_ms",
+    type=float,
+    default=300.0,
+    help="Upper bound for the delay slider (milliseconds)",
+)
+minimal.parser.add_argument(
     "--feedback_auto_calibrate",
     action="store_true",
     help="Play a calibration tone on startup to estimate attenuation and delay automatically",
@@ -72,6 +78,11 @@ minimal.parser.add_argument(
     type=int,
     default=2,
     help="Number of extra chunks to record after the tone to capture its decay",
+)
+minimal.parser.add_argument(
+    "--feedback_no_gui",
+    action="store_true",
+    help="Disable Matplotlib sliders for attenuation and delay (CLI controls only)",
 )
 
 
@@ -133,11 +144,17 @@ class Feedback_Cancellation(buffer.Buffering):
             )
         else:
             self._calibration_guard = 0
+        self._slider_internal_update = False
+        self._attenuation_slider = None
+        self._delay_slider = None
+        self._slider_fig = None
         self._control_thread = None
         if sys.stdin.isatty():
             self._start_control_thread()
         else:
             logging.info("Interactive feedback controls disabled (stdin not a TTY)")
+        if not minimal.args.feedback_no_gui:
+            self._start_slider_ui()
         logging.info(
             "Initial feedback params -> attenuation: %.3f, delay: %.2f ms",
             self.attenuation,
@@ -176,6 +193,7 @@ class Feedback_Cancellation(buffer.Buffering):
             self.delay_ms,
             self.delay_samples,
         )
+        self._update_slider_value(self._delay_slider, self.delay_ms)
 
     def set_delay_ms(self, value_ms):
         value_ms = max(0.0, float(value_ms))
@@ -246,6 +264,7 @@ class Feedback_Cancellation(buffer.Buffering):
     def set_attenuation(self, value):
         self.attenuation = self._clamp_attenuation(value)
         logging.info("feedback attenuation set to %.3f", self.attenuation)
+        self._update_slider_value(self._attenuation_slider, self.attenuation)
 
     def adjust_attenuation(self, delta):
         self.set_attenuation(self.attenuation + delta)
@@ -411,6 +430,109 @@ class Feedback_Cancellation(buffer.Buffering):
         self.play_chunk(DAC, playback_chunk)
         self._last_sent_chunk = processed_chunk
         self._maybe_store_calibration_recording(ADC)
+
+    def _update_slider_value(self, slider, value):
+        if slider is None:
+            return
+        self._slider_internal_update = True
+        try:
+            slider.set_val(value)
+        finally:
+            self._slider_internal_update = False
+
+    def _start_slider_ui(self):
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.widgets import Slider
+        except Exception as exc:  # pragma: no cover - optional GUI dependency
+            logging.warning("Unable to start slider UI: %s", exc)
+            return
+
+        max_delay = max(0.0, float(minimal.args.feedback_max_delay_ms))
+        if max_delay == 0.0:
+            logging.info("feedback_max_delay_ms is 0. Slider UI disabled.")
+            return
+        fig, ax = plt.subplots(figsize=(7, 3))
+
+        fig.suptitle("Feedback cancellation controls", fontsize=12)
+        plt.subplots_adjust(left=0.14, bottom=0.25, top=0.83)
+        ax.axis("off")
+
+        att_ax = fig.add_axes([0.14, 0.15, 0.78, 0.05])
+        delay_ax = fig.add_axes([0.14, 0.05, 0.78, 0.05])
+
+        att_step = self._attenuation_step if self._attenuation_step > 0 else None
+        delay_step = self._delay_step_ms if self._delay_step_ms > 0 else None
+
+        self._attenuation_slider = Slider(
+            att_ax,
+            "Attenuation",
+            self._attenuation_min,
+            self._attenuation_max,
+            valinit=self.attenuation,
+            valstep=att_step,
+        )
+        self._delay_slider = Slider(
+            delay_ax,
+            "Delay (ms)",
+            0.0,
+            max_delay,
+            valinit=self.delay_ms,
+            valstep=delay_step,
+        )
+
+        fig.text(
+            0.5,
+            0.88,
+            "Use the sliders for quick tuning; keyboard controls remain available.",
+            ha="center",
+            va="center",
+            fontsize=9,
+        )
+
+        def _on_att_change(value):
+            if self._slider_internal_update:
+                return
+            self.set_attenuation(value)
+
+        def _on_delay_change(value):
+            if self._slider_internal_update:
+                return
+            self.set_delay_ms(value)
+
+        self._attenuation_slider.on_changed(_on_att_change)
+        self._delay_slider.on_changed(_on_delay_change)
+
+        def _on_close(event):
+            logging.info("Slider window closed.")
+            self._attenuation_slider = None
+            self._delay_slider = None
+            self._slider_fig = None
+
+        fig.canvas.mpl_connect("close_event", _on_close)
+        self._slider_fig = fig
+        plt.show(block=False)
+        logging.info("Matplotlib slider UI ready: attenuation and delay can be tuned visually.")
+
+    def _pump_slider_events(self):
+        if self._slider_fig is None:
+            return
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            return
+        try:
+            plt.pause(0.001)
+        except Exception as exc:
+            logging.debug("Slider UI event loop stopped: %s", exc)
+            self._slider_fig = None
+            self._attenuation_slider = None
+            self._delay_slider = None
+
+    def receive_and_buffer(self):
+        chunk_number = super().receive_and_buffer()
+        self._pump_slider_events()
+        return chunk_number
 
 
 class Feedback_Cancellation__verbose(Feedback_Cancellation, buffer.Buffering__verbose):
