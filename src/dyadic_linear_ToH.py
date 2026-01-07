@@ -35,7 +35,7 @@ minimal.parser.add_argument(
 minimal.parser.add_argument(
     "--linear_wavelet_name",
     type=str,
-    default="db4",
+    default="db2",
     help="Wavelet name used for the Wavelet Packet decomposition (default: 'db4').",
 )
 minimal.parser.add_argument(
