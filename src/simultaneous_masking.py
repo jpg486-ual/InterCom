@@ -30,7 +30,7 @@ minimal.parser.add_argument(
 minimal.parser.add_argument(
     "--masking_factors",
     type=str,
-    default="1.0,2.0,3.0",
+    default="1.0,1.5,2.0",
     help="Comma-separated neighbour factors applied around the masker band.",
 )
 
